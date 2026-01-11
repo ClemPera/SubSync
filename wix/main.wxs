@@ -60,7 +60,7 @@
 
     <Product
         Id='*'
-        Name='subtitle_tool'
+        Name='SubSync'
         UpgradeCode='AE018DA1-4E4B-4C71-BC60-29A3720A2FB8'
         Manufacturer='Clément PERA'
         Language='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='subtitle_tool Installation'/>
+        <Property Id='DiskPrompt' Value='SubSync Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='subtitle_tool'>
+                <Directory Id='APPLICATIONFOLDER' Name='SubSync'>
                     
                     <!--
                       Enabling the license sidecar file in the installer is a four step process:
@@ -123,9 +123,9 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='subtitle_tool.exe'
+                                Name='SubSync.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\subtitle_tool.exe'
+                                Source='$(var.CargoTargetBinDir)\SubSync.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
