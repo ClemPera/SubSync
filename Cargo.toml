@@ -2,6 +2,21 @@
 name = "subtitle_tool"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/ClemPera/SubSync"
+authors = ["Clément PERA"]
+description = "A fast command-line tool for batch processing subtitles: synchronize timing and automatically rename subtitle files to match your video files."
+homepage = "https://github.com/ClemPera/SubSync"
+
+[package.metadata.wix]
+upgrade-guid = "AE018DA1-4E4B-4C71-BC60-29A3720A2FB8"
+path-guid = "812A5151-C6CA-4F14-BC21-59A0FEDA9370"
+license = false
+eula = false
 
 [dependencies]
 regex = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
