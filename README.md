@@ -6,7 +6,7 @@ A fast command-line tool for batch processing subtitles: synchronize timing and 
 
 - ⚡ **Batch Processing** - Process entire folders of subtitles at once
 - 🎯 **Precise Timing** - Shift timestamps with millisecond precision
-- 🔄 **Auto-Rename** - Automatically matches and renames subtitles to video filenames
+- 🔄 **Auto-Rename** - Automatically matches and renames subtitles to video filenames to automatically add the subtitle when playing the video
 - 📝 **Multi-Format** - Supports both .srt and .ass subtitle formats
 - 🎬 **Smart Matching** - Extracts episode numbers from various naming conventions
 
@@ -19,7 +19,7 @@ A fast command-line tool for batch processing subtitles: synchronize timing and 
 
 ```bash
 # Clone or download the source
-git clone <your-repo-url>
+git clone git@github.com:ClemPera/SubSync.git
 cd subsync
 
 # Build release version
