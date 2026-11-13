@@ -92,12 +92,20 @@ Your video player will now automatically load the subtitles!
 
 ## Episode Number Detection
 
-SubSync intelligently extracts episode numbers from various naming patterns:
+SubSync extracts episode numbers from common naming patterns, case-insensitively:
 
-- `E01`, `E001`
-- `ep01`, `episode01`
-- `- 01`, `- 001`
-- Case-insensitive matching
+- `S01E02`, `S1E2`
+- `E01`, `E001`, `EP12`
+- `episode 2`, `episode_03`
+- trailing `- 02`, `_004`
+
+Bracket hashes and CRC tags such as `[329E0924]` or `[7F3DE7F9]` are ignored and never mistaken for an episode number.
+
+## Safe by default
+
+- Rerunning on the same folder is safe: a subtitle already named after its video is shifted in place and never deleted.
+- Existing subtitle files are never overwritten. If the target name is taken, the subtitle is saved under a unique `shifted_` name instead.
+- Subtitle files with no detectable episode are still shifted and saved with a `shifted_` prefix.
 
 ## Timing
 

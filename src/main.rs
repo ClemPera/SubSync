@@ -4,6 +4,16 @@
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+static SXXEXX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bS\d{1,2}E(\d{1,3})\b").unwrap());
+static EP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:\b|_)E(?:P)?(\d{1,3})\b").unwrap());
+static EPISODE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bepisode[_\s.-]*(\d{1,3})\b").unwrap());
+static TRAILING_EP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[\s\-_])(\d{2,3})(?:$|[\s\-_.\[(])").unwrap());
 
 fn parse_timestamp_srt(ts: &str) -> Option<i64> {
     let parts: Vec<&str> = ts.split(&[':', ','][..]).collect();
@@ -117,24 +127,18 @@ fn shift_ass(content: &str, shift_ms: i64) -> String {
 }
 
 fn extract_episode_number(filename: &str) -> Option<u32> {
-    // Try multiple patterns to match various naming conventions
-    let patterns = vec![
-        r"(?i)e(\d+)",                       // E01, e01
-        r"(?i)ep(\d+)",                      // EP01, ep01
-        r"(?i)episode[_\s]*(\d+)",           // episode01, episode 01
-        r"[\s\-_](\d{2,3})(?:\.|$|[\s\-_])", // - 001, _001, 001.
-    ];
-
-    for pattern in patterns {
-        let re = Regex::new(pattern).unwrap();
-        if let Some(caps) = re.captures(filename)
-            && let Some(num) = caps.get(1).and_then(|m| m.as_str().parse().ok())
-        {
+    // Ordered most-specific first; the fallback takes the last number to skip
+    // leading title numbers and bracket hashes.
+    for re in [&*SXXEXX_RE, &*EP_RE, &*EPISODE_RE] {
+        if let Some(num) = re.captures(filename).and_then(|caps| caps[1].parse().ok()) {
             return Some(num);
         }
     }
 
-    None
+    TRAILING_EP_RE
+        .captures_iter(filename)
+        .last()
+        .and_then(|caps| caps[1].parse().ok())
 }
 
 fn find_matching_video(video_files: &[(PathBuf, u32)], episode: u32) -> Option<&PathBuf> {
@@ -142,6 +146,20 @@ fn find_matching_video(video_files: &[(PathBuf, u32)], episode: u32) -> Option<&
         .iter()
         .find(|(_, ep)| *ep == episode)
         .map(|(path, _)| path)
+}
+
+fn unique_shifted_path(folder: &Path, source: &Path, ext: &str) -> PathBuf {
+    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let base = stem.strip_prefix("shifted_").unwrap_or(stem);
+    let mut candidate = folder.join(format!("shifted_{base}.{ext}"));
+
+    let mut counter = 1;
+    while candidate.exists() && candidate != source {
+        candidate = folder.join(format!("shifted_{counter}_{base}.{ext}"));
+        counter += 1;
+    }
+
+    candidate
 }
 
 fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
@@ -168,21 +186,21 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
         let entry = entry?;
         let path = entry.path();
 
-        if let Some(ext) = path.extension() {
-            let ext_str = ext.to_str().unwrap_or("").to_lowercase();
-            let filename = path.file_name().unwrap().to_str().unwrap_or("");
+        let Some(ext) = path.extension() else {
+            continue;
+        };
+        let ext_str = ext.to_str().unwrap_or("").to_lowercase();
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let episode = extract_episode_number(filename);
 
-            if let Some(episode) = extract_episode_number(filename) {
-                match ext_str.as_str() {
-                    "mkv" | "mp4" | "avi" => {
-                        video_files.push((path.clone(), episode));
-                    }
-                    "srt" | "ass" => {
-                        subtitle_files.push((path.clone(), episode, ext_str));
-                    }
-                    _ => {}
+        match ext_str.as_str() {
+            "mkv" | "mp4" | "avi" => {
+                if let Some(episode) = episode {
+                    video_files.push((path, episode));
                 }
             }
+            "srt" | "ass" => subtitle_files.push((path, episode, ext_str)),
+            _ => {}
         }
     }
 
@@ -190,10 +208,12 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
     println!("Found {} subtitle files\n", subtitle_files.len());
 
     for (sub_path, episode, ext) in subtitle_files {
-        println!(
-            "Processing: {}",
-            sub_path.file_name().unwrap().to_str().unwrap()
-        );
+        let sub_name = sub_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        println!("Processing: {sub_name}");
 
         let content = fs::read_to_string(&sub_path)?;
 
@@ -203,24 +223,58 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
             _ => content,
         };
 
-        if let Some(video_path) = find_matching_video(&video_files, episode) {
-            let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
-            let new_name = format!("{}.{}", video_stem, ext);
-            let new_path = folder_path.join(&new_name);
+        let sub_stem = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let already_named = video_files
+            .iter()
+            .any(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(sub_stem));
 
-            fs::write(&new_path, shifted_content)?;
-            fs::remove_file(&sub_path)?;
-            println!("  ✓ Shifted and renamed to: {}", new_name);
+        let (target, kind) = if already_named {
+            (sub_path.clone(), "in place")
+        } else if let Some(video_path) =
+            episode.and_then(|ep| find_matching_video(&video_files, ep))
+        {
+            let video_stem = video_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let candidate = folder_path.join(format!("{video_stem}.{ext}"));
+            if candidate == sub_path || !candidate.exists() {
+                (candidate, "renamed")
+            } else {
+                (
+                    unique_shifted_path(folder_path, &sub_path, &ext),
+                    "target exists",
+                )
+            }
+        } else if episode.is_some() {
+            (
+                unique_shifted_path(folder_path, &sub_path, &ext),
+                "no matching video",
+            )
         } else {
-            let new_name = format!(
-                "shifted_{}",
-                sub_path.file_name().unwrap().to_str().unwrap()
-            );
-            let new_path = folder_path.join(&new_name);
+            (
+                unique_shifted_path(folder_path, &sub_path, &ext),
+                "no episode detected",
+            )
+        };
 
-            fs::write(&new_path, shifted_content)?;
-            fs::remove_file(&sub_path)?;
-            println!("  ✓ Shifted (no matching video found): {}", new_name);
+        if target == sub_path {
+            if shift_ms != 0 {
+                fs::write(&sub_path, &shifted_content)?;
+            }
+            println!("  ✓ Shifted in place: {sub_name}");
+            continue;
+        }
+
+        fs::write(&target, &shifted_content)?;
+        fs::remove_file(&sub_path)?;
+
+        let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        match kind {
+            "renamed" => println!("  ✓ Shifted and renamed to: {target_name}"),
+            "target exists" => println!("  ! Target exists, saved as: {target_name}"),
+            "no matching video" => println!("  ✓ Shifted (no matching video): {target_name}"),
+            _ => println!("  ✓ Shifted (no episode detected): {target_name}"),
         }
     }
 
@@ -400,10 +454,39 @@ mod tests {
             ("Show_004.mkv", Some(4)),
             ("Show S01E02.mkv", Some(2)),
             ("Show with no number.mkv", None),
+            ("[SubsPlease] Show - 07 (1080p) [ABCD1234].mkv", Some(7)),
+            ("[86] Eighty Six - 11 [1080p].mkv", Some(11)),
+            ("Show 2019 - 05.mkv", Some(5)),
+            (
+                "March.Comes.in.like.a.Lion.S01E22.FiNAL.SUBFRENCH.1080p.WEB.x264-UwU.mkv",
+                Some(22),
+            ),
+            ("Show x264-UwU.mkv", None),
         ];
         for (name, expected) in cases {
             assert_eq!(extract_episode_number(name), expected, "input: {name}");
         }
+
+        let hashes = [
+            "329E0924", "CB461B1B", "402BCBCD", "10500A45", "7B349779", "F9E75ED3", "9F64F894",
+            "7E924AB9", "1C52E0D1", "7F3DE7F9", "A389329C", "0F933B5B", "4A35E64E", "31CB8137",
+            "B80A49F0", "EE6E7316", "106E9C97", "2EAA6FC0", "ADB55FD4", "542A57D9", "F88F739C",
+        ];
+        for (index, hash) in hashes.iter().enumerate() {
+            let episode = index + 1;
+            let name =
+                format!("[Commie] 3-gatsu no Lion - {episode:02} [BD 720p AAC] [{hash}].srt");
+            assert_eq!(
+                extract_episode_number(&name),
+                Some(episode as u32),
+                "input: {name}"
+            );
+        }
+
+        assert_eq!(
+            extract_episode_number("[Commie] 3-gatsu no Lion - 01 [BD 720p AAC].srt"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -457,6 +540,114 @@ mod tests {
         assert!(!dir.join("lone E05.srt").exists());
         let out = fs::read_to_string(dir.join("shifted_lone E05.srt")).expect("shifted file");
         assert!(out.contains("00:00:01,500 --> 00:00:02,500"), "got:\n{out}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_rerun_does_not_delete_renamed_subtitle() {
+        let dir = unique_temp_dir("rerun");
+        fs::write(dir.join("Show E01.mkv"), b"video").unwrap();
+        fs::write(
+            dir.join("sub E01.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        )
+        .unwrap();
+
+        process_folder(&dir, 0).expect("first run should succeed");
+        assert!(dir.join("Show E01.srt").exists());
+
+        process_folder(&dir, 0).expect("second run should succeed");
+        let content = fs::read_to_string(dir.join("Show E01.srt")).expect("renamed file");
+        assert!(content.contains("Hello"), "got:\n{content}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_duplicate_episode_does_not_overwrite() {
+        let dir = unique_temp_dir("duplicate");
+        fs::write(dir.join("Show E01.mkv"), b"video").unwrap();
+        fs::write(
+            dir.join("first E01.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nFirst\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("second E01.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nSecond\n",
+        )
+        .unwrap();
+
+        process_folder(&dir, 1000).expect("process_folder should succeed");
+
+        assert!(dir.join("Show E01.srt").exists());
+        let mut srt_paths = Vec::new();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("srt") {
+                srt_paths.push(path);
+            }
+        }
+        assert_eq!(srt_paths.len(), 2, "expected two subtitle files");
+        assert!(
+            srt_paths.iter().any(|path| path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .starts_with("shifted_")),
+            "expected one shifted file, got: {srt_paths:?}"
+        );
+
+        let combined = srt_paths
+            .iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(combined.contains("First"), "got:\n{combined}");
+        assert!(combined.contains("Second"), "got:\n{combined}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_no_episode_uses_shifted_prefix() {
+        let dir = unique_temp_dir("noepisode");
+        fs::write(
+            dir.join("random.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+        )
+        .unwrap();
+
+        process_folder(&dir, 500).expect("process_folder should succeed");
+
+        assert!(!dir.join("random.srt").exists());
+        let out = fs::read_to_string(dir.join("shifted_random.srt")).expect("shifted file");
+        assert!(out.contains("00:00:01,500 --> 00:00:02,500"), "got:\n{out}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_shifted_prefix_does_not_stack() {
+        let dir = unique_temp_dir("nodouble");
+        fs::write(
+            dir.join("shifted_lone E05.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+        )
+        .unwrap();
+
+        process_folder(&dir, 1000).expect("first run should succeed");
+        process_folder(&dir, 1000).expect("second run should succeed");
+
+        assert!(dir.join("shifted_lone E05.srt").exists());
+        for entry in fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains("shifted_shifted_"),
+                "unexpected stacked prefix: {name}"
+            );
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
