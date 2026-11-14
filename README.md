@@ -107,6 +107,12 @@ Bracket hashes and CRC tags such as `[329E0924]` or `[7F3DE7F9]` are ignored and
 - Existing subtitle files are never overwritten. If the target name is taken, the subtitle is saved under a unique `shifted_` name instead.
 - Subtitle files with no detectable episode are still shifted and saved with a `shifted_` prefix.
 
+## Output and failures
+
+Every run ends with a summary of renamed, shifted-only, already-named, and failed files. Subtitles that could not be renamed are listed with their reason, and read or write errors are listed separately.
+
+Warnings such as an unmatched episode still exit with status 0. Hard processing errors exit with status 1.
+
 ## Timing
 
 - Positive values (e.g., `2.5`) shift subtitles later

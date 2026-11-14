@@ -3,6 +3,7 @@
 
 use regex::Regex;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -162,7 +163,75 @@ fn unique_shifted_path(folder: &Path, source: &Path, ext: &str) -> PathBuf {
     candidate
 }
 
-fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
+fn file_name(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+}
+
+fn paint(code: &str, text: &str) -> String {
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+enum Outcome {
+    InPlace,
+    Renamed(PathBuf),
+    ShiftedOnly { target: PathBuf, reason: String },
+    TargetExists { target: PathBuf, occupied: PathBuf },
+}
+
+#[derive(Default)]
+struct Report {
+    processed: usize,
+    renamed: usize,
+    shifted_only: usize,
+    already_named: usize,
+    warnings: Vec<(String, String)>,
+    failures: Vec<(String, String)>,
+}
+
+impl Report {
+    fn warn(&mut self, file: &str, reason: String) {
+        self.warnings.push((file.to_string(), reason));
+    }
+
+    fn fail(&mut self, file: &str, reason: String) {
+        self.failures.push((file.to_string(), reason));
+    }
+
+    fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    fn print_summary(&self) {
+        println!(
+            "\nSummary: {} processed, {} renamed, {} shifted only, {} already named, {} failed",
+            self.processed,
+            self.renamed,
+            self.shifted_only,
+            self.already_named,
+            self.failures.len()
+        );
+
+        if !self.warnings.is_empty() {
+            println!("\n{}", paint("33", "⚠ Warnings:"));
+            for (file, reason) in &self.warnings {
+                println!("{}", paint("33", &format!("  - {file}: {reason}")));
+            }
+        }
+
+        if !self.failures.is_empty() {
+            println!("\n{}", paint("31", "✗ Failed:"));
+            for (file, reason) in &self.failures {
+                println!("{}", paint("31", &format!("  - {file}: {reason}")));
+            }
+        }
+    }
+}
+
+fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<Report> {
     if !folder_path.exists() || !folder_path.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -190,7 +259,7 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
             continue;
         };
         let ext_str = ext.to_str().unwrap_or("").to_lowercase();
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let filename = file_name(&path);
         let episode = extract_episode_number(filename);
 
         match ext_str.as_str() {
@@ -207,15 +276,22 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
     println!("Found {} video files", video_files.len());
     println!("Found {} subtitle files\n", subtitle_files.len());
 
+    let mut report = Report::default();
+
     for (sub_path, episode, ext) in subtitle_files {
-        let sub_name = sub_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
+        report.processed += 1;
+        let sub_name = file_name(&sub_path).to_string();
         println!("Processing: {sub_name}");
 
-        let content = fs::read_to_string(&sub_path)?;
+        let content = match fs::read_to_string(&sub_path) {
+            Ok(content) => content,
+            Err(e) => {
+                let reason = format!("failed to read file: {e}");
+                report.fail(&sub_name, reason.clone());
+                println!("  {}", paint("31", &format!("✗ {reason}")));
+                continue;
+            }
+        };
 
         let shifted_content = match ext.as_str() {
             "srt" => shift_srt(&content, shift_ms),
@@ -228,8 +304,8 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
             .iter()
             .any(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(sub_stem));
 
-        let (target, kind) = if already_named {
-            (sub_path.clone(), "in place")
+        let outcome = if already_named {
+            Outcome::InPlace
         } else if let Some(video_path) =
             episode.and_then(|ep| find_matching_video(&video_files, ep))
         {
@@ -238,48 +314,102 @@ fn process_folder(folder_path: &Path, shift_ms: i64) -> std::io::Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             let candidate = folder_path.join(format!("{video_stem}.{ext}"));
-            if candidate == sub_path || !candidate.exists() {
-                (candidate, "renamed")
+            if candidate == sub_path {
+                Outcome::InPlace
+            } else if !candidate.exists() {
+                Outcome::Renamed(candidate)
             } else {
-                (
-                    unique_shifted_path(folder_path, &sub_path, &ext),
-                    "target exists",
-                )
+                Outcome::TargetExists {
+                    target: unique_shifted_path(folder_path, &sub_path, &ext),
+                    occupied: candidate,
+                }
             }
-        } else if episode.is_some() {
-            (
-                unique_shifted_path(folder_path, &sub_path, &ext),
-                "no matching video",
-            )
+        } else if let Some(episode) = episode {
+            Outcome::ShiftedOnly {
+                target: unique_shifted_path(folder_path, &sub_path, &ext),
+                reason: format!("no matching video for episode {episode}"),
+            }
         } else {
-            (
-                unique_shifted_path(folder_path, &sub_path, &ext),
-                "no episode detected",
-            )
+            Outcome::ShiftedOnly {
+                target: unique_shifted_path(folder_path, &sub_path, &ext),
+                reason: "no episode detected".to_string(),
+            }
         };
 
-        if target == sub_path {
-            if shift_ms != 0 {
-                fs::write(&sub_path, &shifted_content)?;
+        let destination = match &outcome {
+            Outcome::InPlace => None,
+            Outcome::Renamed(path)
+            | Outcome::ShiftedOnly { target: path, .. }
+            | Outcome::TargetExists { target: path, .. } => Some(path.as_path()),
+        };
+        let target_path = destination.unwrap_or(&sub_path);
+
+        if target_path == sub_path {
+            if shift_ms != 0
+                && let Err(e) = fs::write(&sub_path, &shifted_content)
+            {
+                let reason = format!("failed to write file: {e}");
+                report.fail(&sub_name, reason.clone());
+                println!("  {}", paint("31", &format!("✗ {reason}")));
+                continue;
             }
-            println!("  ✓ Shifted in place: {sub_name}");
-            continue;
+        } else {
+            if let Err(e) = fs::write(target_path, &shifted_content) {
+                let reason = format!("failed to write {}: {e}", file_name(target_path));
+                report.fail(&sub_name, reason.clone());
+                println!("  {}", paint("31", &format!("✗ {reason}")));
+                continue;
+            }
+
+            if let Err(e) = fs::remove_file(&sub_path) {
+                let reason = format!(
+                    "wrote {} but failed to remove original: {e}",
+                    file_name(target_path)
+                );
+                report.fail(&sub_name, reason.clone());
+                println!("  {}", paint("31", &format!("✗ {reason}")));
+                continue;
+            }
         }
 
-        fs::write(&target, &shifted_content)?;
-        fs::remove_file(&sub_path)?;
-
-        let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        match kind {
-            "renamed" => println!("  ✓ Shifted and renamed to: {target_name}"),
-            "target exists" => println!("  ! Target exists, saved as: {target_name}"),
-            "no matching video" => println!("  ✓ Shifted (no matching video): {target_name}"),
-            _ => println!("  ✓ Shifted (no episode detected): {target_name}"),
+        match outcome {
+            Outcome::InPlace => {
+                report.already_named += 1;
+                let message = if shift_ms == 0 {
+                    format!("✓ Already correctly named: {sub_name}")
+                } else {
+                    format!("✓ Shifted in place: {sub_name}")
+                };
+                println!("  {}", paint("32", &message));
+            }
+            Outcome::Renamed(target) => {
+                report.renamed += 1;
+                let target_name = file_name(&target);
+                println!(
+                    "  {}",
+                    paint("32", &format!("✓ Shifted and renamed to: {target_name}"))
+                );
+            }
+            Outcome::ShiftedOnly { target, reason } => {
+                report.shifted_only += 1;
+                let target_name = file_name(&target);
+                let warning = format!("{reason} (saved as {target_name})");
+                report.warn(&sub_name, warning.clone());
+                println!("  {}", paint("33", &format!("⚠ {warning}")));
+            }
+            Outcome::TargetExists { target, occupied } => {
+                report.shifted_only += 1;
+                let target_name = file_name(&target);
+                let occupied_name = file_name(&occupied);
+                let warning =
+                    format!("target {occupied_name} already exists, saved as {target_name}");
+                report.warn(&sub_name, warning.clone());
+                println!("  {}", paint("33", &format!("⚠ {warning}")));
+            }
         }
     }
 
-    println!("\n✓ All done!");
-    Ok(())
+    Ok(report)
 }
 
 fn main() {
@@ -307,9 +437,17 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Err(e) = process_folder(folder_path, shift_ms) {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
+    match process_folder(folder_path, shift_ms) {
+        Ok(report) => {
+            report.print_summary();
+            if report.has_failures() {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -557,9 +695,12 @@ mod tests {
         process_folder(&dir, 0).expect("first run should succeed");
         assert!(dir.join("Show E01.srt").exists());
 
-        process_folder(&dir, 0).expect("second run should succeed");
+        let report = process_folder(&dir, 0).expect("second run should succeed");
         let content = fs::read_to_string(dir.join("Show E01.srt")).expect("renamed file");
         assert!(content.contains("Hello"), "got:\n{content}");
+        assert_eq!(report.already_named, 1);
+        assert!(report.warnings.is_empty());
+        assert!(report.failures.is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -579,9 +720,17 @@ mod tests {
         )
         .unwrap();
 
-        process_folder(&dir, 1000).expect("process_folder should succeed");
+        let report = process_folder(&dir, 1000).expect("process_folder should succeed");
 
         assert!(dir.join("Show E01.srt").exists());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|(_, reason)| reason.contains("already exists")),
+            "expected target-exists warning, got: {:?}",
+            report.warnings
+        );
         let mut srt_paths = Vec::new();
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
@@ -648,6 +797,85 @@ mod tests {
                 "unexpected stacked prefix: {name}"
             );
         }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_reports_invalid_utf8_and_continues() {
+        let dir = unique_temp_dir("invalid");
+        fs::write(dir.join("Show E02.mkv"), b"video").unwrap();
+        fs::write(
+            dir.join("ok E02.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        )
+        .unwrap();
+        fs::write(dir.join("broken E01.srt"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let report = process_folder(&dir, 0).expect("process_folder should succeed");
+
+        assert_eq!(report.processed, 2);
+        assert_eq!(report.renamed, 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].0, "broken E01.srt");
+        assert!(
+            report.failures[0].1.contains("failed to read"),
+            "got: {:?}",
+            report.failures
+        );
+        assert!(dir.join("Show E02.srt").exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_warns_on_no_matching_video() {
+        let dir = unique_temp_dir("nomatchwarn");
+        fs::write(
+            dir.join("lone E05.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+        )
+        .unwrap();
+
+        let report = process_folder(&dir, 500).expect("process_folder should succeed");
+
+        assert_eq!(report.shifted_only, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].0, "lone E05.srt");
+        assert!(
+            report.warnings[0]
+                .1
+                .contains("no matching video for episode 5"),
+            "got: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].1.contains("shifted_lone E05.srt"),
+            "got: {:?}",
+            report.warnings
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn process_folder_warns_on_no_episode() {
+        let dir = unique_temp_dir("noepisodewarn");
+        fs::write(
+            dir.join("random.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+        )
+        .unwrap();
+
+        let report = process_folder(&dir, 500).expect("process_folder should succeed");
+
+        assert_eq!(report.warnings.len(), 1);
+        assert!(
+            report.warnings[0].1.contains("no episode detected"),
+            "got: {:?}",
+            report.warnings
+        );
+        assert!(dir.join("shifted_random.srt").exists());
 
         fs::remove_dir_all(&dir).ok();
     }
